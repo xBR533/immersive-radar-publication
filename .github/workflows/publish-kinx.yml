@@ -1,0 +1,65 @@
+# IR-019B: one manually dispatched, bounded acquisition and publication. No schedule.
+name: Publish one KINX observation
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type PUBLISH-ONE to acquire one NOAA KINX volume and publish it
+        required: true
+permissions: {}
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: inputs.confirm == 'PUBLISH-ONE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # commit the published files to this repository
+      pages: write      # deploy them to GitHub Pages
+      id-token: write   # required by actions/deploy-pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      PRODUCER_COMMIT: ae50ad811b6a17063d665e026b9b68fba02ce7c8
+      PUBLIC_KEY: beK1btFpakGpYtxipjxr4yKUg+DhKP2Ww9g6pjmHvP8=
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the pinned producer (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: xBR533/immersive-radar
+          ref: ${{ env.PRODUCER_COMMIT }}
+          ssh-key: ${{ secrets.PRODUCER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+          path: producer
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e "producer/pipeline[publish]"
+      - name: Acquire one volume, produce, sign and verify
+        env:
+          SIGNING_KEY: ${{ secrets.IR019B_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing.pem"
+          trap 'rm -f "$RUNNER_TEMP/signing.pem"' EXIT
+          python -m immersive_radar_pipeline.publish acquire-publish --root site/kinx --work "$RUNNER_TEMP/work" \
+            --signing-key "$RUNNER_TEMP/signing.pem" --origin ir019b-experiment > "$RUNNER_TEMP/result.json"
+          rm -f "$RUNNER_TEMP/signing.pem"
+          python -m immersive_radar_pipeline.publish verify --root site/kinx --public-key "$PUBLIC_KEY" > /dev/null
+          { echo '```json'; cat "$RUNNER_TEMP/result.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          git status --porcelain
+      - name: Commit the published files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site
+          git commit -m "Publish one KINX observation (IR-019B)"
+          git push
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deploy
+        uses: actions/deploy-pages@v4
