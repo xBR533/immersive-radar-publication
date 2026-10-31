@@ -1,0 +1,90 @@
+# IR-020B owner-approved bounded pilot (2026-10-31): ONE manual dispatch only; disabled after the run.
+# One manual dispatch publishes AT MOST three genuinely newer completed KINX volumes, one per round,
+# then stops by itself. No schedule, no retries of a failed acquisition, no other radar.
+# Budget per dispatch: <= 3 rounds x 20 min runner time (60 min ceiling, typically ~25 min);
+# <= 3 NOAA objects (64 MiB ceiling each, KINX volumes are ~10–13 MB, so ~36 MB expected);
+# <= 3 Pages deployments; site keeps the 8 newest packages (~0.5 MB each).
+# Immediate stop: gh run cancel <run-id> -R xBR533/immersive-radar-publication
+name: Publish up to three newer KINX observations (pilot)
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type PILOT-THREE to publish up to three newer KINX volumes, then stop
+        required: true
+permissions: {}
+concurrency:
+  group: publish          # shared with publish-kinx.yml: never two publishers at once
+  cancel-in-progress: false
+jobs:
+  round:
+    if: inputs.confirm == 'PILOT-THREE'
+    strategy:
+      max-parallel: 1     # rounds run one after another
+      fail-fast: true     # any failure ends the pilot; the last good publication stays live
+      matrix:
+        round: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      PRODUCER_COMMIT: 87d5a67a2020cc608c493b9358db145335caedc3
+      PUBLIC_KEY: beK1btFpakGpYtxipjxr4yKUg+DhKP2Ww9g6pjmHvP8=
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }          # the previous round's published files, not the dispatch snapshot
+      - name: Check out the pinned producer (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: xBR533/immersive-radar
+          ref: ${{ env.PRODUCER_COMMIT }}
+          ssh-key: ${{ secrets.PRODUCER_READ_DEPLOY_KEY }}
+          persist-credentials: false
+          path: producer
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e "producer/pipeline[publish]"
+      - name: Wait (listing only) for a newer completed volume, then publish exactly one
+        id: publish
+        env:
+          SIGNING_KEY: ${{ secrets.IR019B_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing.pem"
+          trap 'rm -f "$RUNNER_TEMP/signing.pem"' EXIT
+          # Up to 12 archive listings, one a minute. A listing downloads no radar data. KINX completes a
+          # volume every ~4–6 min and it reaches the archive a few minutes later; polling faster gains nothing.
+          for attempt in $(seq 1 12); do
+            python -m immersive_radar_pipeline.publish acquire-if-newer --root site/kinx --work "$RUNNER_TEMP/work-$attempt" \
+              --signing-key "$RUNNER_TEMP/signing.pem" --origin ir020-pilot > "$RUNNER_TEMP/result.json"
+            status=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUNNER_TEMP/result.json")
+            [ "$status" = published ] && break
+            sleep 60
+          done
+          rm -f "$RUNNER_TEMP/signing.pem"
+          { echo '```json'; cat "$RUNNER_TEMP/result.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          [ "$status" = published ] || { echo "No newer completed volume within 12 minutes; nothing published."; exit 0; }
+          python -m immersive_radar_pipeline.publish verify --root site/kinx --public-key "$PUBLIC_KEY" > /dev/null
+      - name: Commit the published files
+        if: steps.publish.outputs.status == 'published'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A site
+          git commit -m "Publish KINX observation (IR-020 pilot round ${{ matrix.round }})"
+          git push
+      - if: steps.publish.outputs.status == 'published'
+        uses: actions/configure-pages@v5
+      - if: steps.publish.outputs.status == 'published'
+        uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deploy
+        if: steps.publish.outputs.status == 'published'
+        uses: actions/deploy-pages@v4
