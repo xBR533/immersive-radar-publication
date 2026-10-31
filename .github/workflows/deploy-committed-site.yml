@@ -1,0 +1,40 @@
+# IR-020B owner-approved ONE-SHOT recovery (2026-10-31): deploy the already committed, verified site to Pages.
+# No acquisition, no producer, no signing key, no commit. Deploys exactly commit 8a71fef and refuses any other index.
+name: Deploy committed site once (recovery)
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type DEPLOY-8A71FEF to deploy the committed site at 8a71fef
+        required: true
+permissions: {}
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: inputs.confirm == 'DEPLOY-8A71FEF'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 8a71fef0b808d4ad4aed7ac84689ce019e139443, persist-credentials: false }
+      - name: Refuse anything but the verified index and its packages
+        run: |
+          echo "911c7797fc30dd1a6f1084dc3d504fe482cc6ed64416ef2534a1329e49ada292  site/kinx/index.json" | sha256sum -c -
+          for f in site/kinx/packages/*.irradar; do
+            [ "$(sha256sum "$f" | cut -c1-64)" = "$(basename "$f" .irradar)" ] || { echo "content address mismatch: $f"; exit 1; }
+          done
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site, name: github-pages-recovery, retention-days: 1 }
+      - id: deploy
+        uses: actions/deploy-pages@v4
+        with: { artifact_name: github-pages-recovery }
