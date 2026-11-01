@@ -98,9 +98,17 @@ class FakeArchive:
 
 
 class FakePages:
-    """Whole-site atomic swap, like a Pages deployment. Failure injection leaves the previous deployment live."""
+    """Whole-site atomic swap, like a Pages deployment, behind a simulated CDN.
+    fail_next      deploy-pages fails; the previous deployment stays live
+    unreachable    every request raises (network error / timeout / 5xx)
+    origin_body    the origin serves these bytes instead of the deployment (tampered / foreign index)
+    stale_plain    the plain URL keeps serving the previous deployment (CDN not yet refreshed); the cache-busted
+                   origin request sees the new one
+    unpublished    the whole site answers 404 (e.g. owner unpublished it)"""
     def __init__(self, root: Path):
-        self.root, self.live, self.fail_next, self.deployments = root, None, 0, 0
+        self.root, self.live, self.previous, self.fail_next, self.deployments = root, None, None, 0, 0
+        self.unreachable = self.stale_plain = self.unpublished = False
+        self.origin_body = None
 
     def deploy(self, site: Path):
         if self.fail_next:
@@ -108,12 +116,24 @@ class FakePages:
             raise RuntimeError('simulated deploy-pages failure')
         target = self.root / f'deployment-{self.deployments}'
         shutil.copytree(site, target)
-        self.live, self.deployments = target, self.deployments + 1
+        self.previous, self.live, self.deployments = self.live, target, self.deployments + 1
+
+    @staticmethod
+    def _index(deployment):
+        if deployment is None or not (deployment / 'kinx/index.json').exists():
+            return None
+        return (deployment / 'kinx/index.json').read_bytes()
 
     def fetch(self, url, bust=True):
-        if self.live is None or not (self.live / 'kinx/index.json').exists():
+        if self.unreachable:
+            raise OSError('simulated Pages outage')
+        if self.unpublished:
             return None
-        return (self.live / 'kinx/index.json').read_bytes()
+        if not bust and self.stale_plain:
+            return self._index(self.previous)
+        if self.origin_body is not None:
+            return self.origin_body
+        return self._index(self.live)
 
 
 class FakeGitHub:
@@ -163,6 +183,8 @@ class World:
     auth: dict
     clock: list = field(default_factory=lambda: [T0 + timedelta(minutes=50)])
     enabled: str = 'true'
+    enabled_at_deploy: str | None = None      # value the deploy job sees, if flipped after stage
+    deploy_delay: timedelta = timedelta(0)    # clock advance between stage and the deploy job
     runs: int = 0
     produced: list = field(default_factory=list)
 
@@ -199,7 +221,8 @@ def make_world(tmp_path: Path, **auth_overrides) -> World:
     auth = {'format': 'ir023-pilot-authorization', 'version': 1, 'pilotId': 'ir023-sim',
             'notBeforeUtc': pilot.iso(T0), 'expiresUtc': pilot.iso(T0 + timedelta(hours=48)),
             'maxSourceObjects': 600, 'maxSourceBytes': 8 << 30, 'maxRepositoryBytes': 400 << 20,
-            'repositoryBaselineBytes': 2 << 20, 'workflowFile': 'publish-kinx-scheduled.yml'}
+            'repositoryBaselineBytes': 2 << 20, 'workflowFile': 'publish-kinx-scheduled.yml',
+            'allowInitialPublication': True}   # the simulated site starts empty; see the absent-index tests
     auth.update(auth_overrides)
     (seed / 'pilot').mkdir()
     (seed / 'pilot/authorization.json').write_text(json.dumps(auth, indent=2) + '\n')
@@ -244,52 +267,61 @@ def level2_bytes(key: str, size: int = 200_000) -> bytes:
     return b'AR2V0006.' + (seed * (size // 32 + 1))[: size - 9]
 
 
-def run_once(w: World, *, produce=None, cancel_publish=False, interrupt=None) -> dict:
-    """One scheduled execution, job by job, with the workflow's conditions (see test_workflow_shape)."""
+def run_once(w: World, *, produce=None, cancel_after_acquire=False, interrupt=None) -> dict:
+    """One scheduled execution, job by job, using the workflow's `needs`/`if` conditions exactly
+    (guard -> acquire -> stage -> deploy, and stop); test_workflow_conditions checks the YAML says the same."""
     r = w.gh.new_run()
-    jobs, out = {}, {'run': r}
-    g_repo = w.checkout(f'guard-{r["id"]}')
+    jobs, out, cancelled = {}, {'run': r}, False
     try:
-        g = pilot.guard(g_repo, now=w.now(), enabled=w.enabled, api=w.gh.api, repo_slug='xBR533/immersive-radar-publication',
-                        run_id=r['id'], run_number=r['run_number'])
+        g = pilot.guard(w.checkout(f'guard-{r["id"]}'), now=w.now(), enabled=w.enabled, api=w.gh.api,
+                        repo_slug='xBR533/immersive-radar-publication', run_id=r['id'], run_number=r['run_number'])
         jobs['guard'] = 'success'
     except pilot.Failure as exc:
         g, jobs['guard'] = {'acquire': False, 'deploy': False, 'stop': False, 'reason': exc.code}, 'failure'
     out['guard'] = g
+    # acquire: if needs.guard.outputs.acquire == 'true'
+    if jobs['guard'] == 'success' and g['acquire']:
+        try:
+            out['acquire'] = pilot.acquire(
+                w.checkout(f'acquire-{r["id"]}'), now_fn=w.now, enabled=w.enabled, public_b64=w.public_b64,
+                signing_key=w.signing, work=w.tmp / 'work' / str(r['id']), run_id=r['id'], attempt=1,
+                produce=interrupt or produce or w.fake_produce)
+            jobs['acquire'] = 'success'
+        except pilot.Refusal as exc:
+            out['acquire'], jobs['acquire'] = {'status': 'refused', 'reason': exc.code}, 'success'
+        except pilot.Failure as exc:
+            out['acquire'], jobs['acquire'] = {'status': 'failed', 'reason': exc.code}, 'failure'
+        except KeyboardInterrupt:
+            out['acquire'], jobs['acquire'], cancelled = {'status': 'interrupted'}, 'cancelled', True
+        if cancel_after_acquire:
+            jobs['acquire'], cancelled = 'cancelled', True
+    acquire_result = jobs.get('acquire', 'skipped')
+    # stage: !cancelled() && guard success && guard.deploy && acquire.result in (success, failure, skipped)
     stage = None
-    if jobs['guard'] == 'success' and g['deploy']:
-        p_repo = w.checkout(f'publish-{r["id"]}')
-        failed = False
-        if g['acquire']:
-            try:
-                out['acquire'] = pilot.acquire(
-                    p_repo, now_fn=w.now, enabled=w.enabled, public_b64=w.public_b64, signing_key=w.signing,
-                    work=w.tmp / 'work' / str(r['id']), run_id=r['id'], attempt=1,
-                    produce=interrupt or produce or w.fake_produce)
-            except pilot.Refusal as exc:
-                out['acquire'] = {'status': 'refused', 'reason': exc.code}
-            except pilot.Failure as exc:
-                out['acquire'], failed = {'status': 'failed', 'reason': exc.code}, True
-            except KeyboardInterrupt:
-                out['acquire'] = {'status': 'interrupted'}
-                jobs['publish'] = 'cancelled'
-        if jobs.get('publish') != 'cancelled' and not cancel_publish:
-            try:
-                stage = pilot.stage(p_repo, public_b64=w.public_b64, live_index_url='https://example.invalid/kinx/index.json',
-                                    fetch=w.pages.fetch)
-            except pilot.Failure as exc:
-                stage, failed = {'deploy': False, 'reason': exc.code}, True
-            out['stage'] = stage
-            jobs['publish'] = 'failure' if failed else 'success'
-        elif cancel_publish:
-            jobs['publish'] = 'cancelled'
-        if stage and stage['deploy']:
-            try:
-                w.pages.deploy(p_repo / 'site')
-                jobs['deploy'] = 'success'
-                out['probe'] = pilot.probe('u', stage['committedIndexSHA256'], fetch=w.pages.fetch, timeout_s=0, interval_s=0)
-            except RuntimeError:
-                jobs['deploy'] = 'failure'
+    if not cancelled and jobs['guard'] == 'success' and g['deploy'] and acquire_result in ('success', 'failure', 'skipped'):
+        try:
+            stage = pilot.stage(w.checkout(f'stage-{r["id"]}'), public_b64=w.public_b64, enabled=w.enabled, now=w.now(),
+                                live_index_url='https://example.invalid/kinx/index.json', fetch=w.pages.fetch)
+            jobs['stage'] = 'success'
+        except pilot.Refusal as exc:
+            stage, jobs['stage'] = {'deploy': False, 'reason': exc.code}, 'success'
+        except pilot.Failure as exc:
+            stage, jobs['stage'] = {'deploy': False, 'reason': exc.code}, 'failure'
+        out['stage'] = stage
+    # deploy: !cancelled() && stage success && stage.deploy && vars.PUBLICATION_ENABLED == 'true'
+    deploy_enabled = w.enabled if w.enabled_at_deploy is None else w.enabled_at_deploy
+    if not cancelled and jobs.get('stage') == 'success' and stage['deploy'] and deploy_enabled == 'true':
+        deploy_repo = w.checkout(f'deploy-{r["id"]}')
+        try:
+            out['preflight'] = pilot.preflight(deploy_repo, enabled=deploy_enabled, now=w.now() + w.deploy_delay)
+            w.pages.deploy(w.tmp / 'runners' / f'stage-{r["id"]}' / 'site')
+            out['probe'] = pilot.probe('u', stage['committedIndexSHA256'], fetch=w.pages.fetch, timeout_s=0, interval_s=0)
+            jobs['deploy'] = 'success' if out['probe']['visible'] else 'failure'
+        except pilot.Refusal as exc:
+            out['preflight'], jobs['deploy'] = {'refused': exc.code}, 'failure'
+        except RuntimeError:
+            jobs['deploy'] = 'failure'
+    # stop: needs.guard.outputs.stop == 'true'
     if jobs['guard'] == 'success' and g['stop']:
         try:
             w.gh.disable()
@@ -298,7 +330,7 @@ def run_once(w: World, *, produce=None, cancel_publish=False, interrupt=None) ->
             jobs['stop'] = 'failure'
     states = set(jobs.values())
     r['status'] = 'completed'
-    r['conclusion'] = 'cancelled' if 'cancelled' in states else 'failure' if 'failure' in states else 'success'
+    r['conclusion'] = 'cancelled' if cancelled else 'failure' if 'failure' in states else 'success'
     w.gh.jobs[r['id']] = [{'name': n, 'conclusion': c, 'steps': [{'name': 'run'}]} for n, c in jobs.items()]
     out['jobs'], out['conclusion'] = jobs, r['conclusion']
     w.advance(5)

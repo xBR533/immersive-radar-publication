@@ -8,5 +8,6 @@
   "maxSourceBytes": 8589934592,
   "maxRepositoryBytes": 419430400,
   "repositoryBaselineBytes": 2097152,
-  "workflowFile": "publish-kinx-scheduled.yml"
+  "workflowFile": "publish-kinx-scheduled.yml",
+  "allowInitialPublication": false
 }

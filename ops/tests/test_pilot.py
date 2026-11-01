@@ -26,9 +26,10 @@ def test_one_valid_newer_observation_is_reserved_published_deployed_and_visible(
     put(world, KEYS[0])
     out = run_once(world)
     assert out['guard']['acquire'] and out['acquire']['status'] == 'published'
-    assert out['conclusion'] == 'success' and out['jobs'] == {'guard': 'success', 'publish': 'success', 'deploy': 'success'}
+    assert out['conclusion'] == 'success'
+    assert out['jobs'] == {'guard': 'success', 'acquire': 'success', 'stage': 'success', 'deploy': 'success'}
     assert committed_source(world) == live_source(world) == KEYS[0]
-    assert out['probe']['visible'] is True
+    assert out['probe']['visible'] is True and out['probe']['outcome'] == 'visible'
     t = totals(world)
     assert (t.objects, t.source_bytes, t.publications) == (1, 200_000, 1)
     assert len(world.archive.get_requests()) == 1 and world.archive.body_bytes == 200_000
@@ -89,7 +90,7 @@ def test_live_newer_than_committed_is_never_overwritten(world, tmp_path, monkeyp
     put(other, KEYS[1])
     out = run_once(other)
     assert out['acquire']['status'] == 'published' and committed_source(other) == KEYS[1]
-    assert out['stage']['reason'] == 'live-newer-than-committed' and out['jobs']['publish'] == 'failure'
+    assert out['stage']['reason'] == 'live-newer-than-committed' and out['jobs']['stage'] == 'failure'
     assert 'deploy' not in out['jobs'] and world.pages.live == live_before and live_source(world) == KEYS[3]
 
 
@@ -229,10 +230,10 @@ def test_failed_deployment_is_recovered_from_git_without_a_new_volume(world):
 
 def test_runner_interrupted_after_publication_commit_is_recovered_next_run(world):
     put(world, KEYS[0])
-    out = run_once(world, cancel_publish=True)         # killed after the push, before staging/deploy
+    out = run_once(world, cancel_after_acquire=True)   # killed after the push, before staging/deploy
     assert out['conclusion'] == 'cancelled' and committed_source(world) == KEYS[0] and live_source(world) is None
     out = run_once(world)
-    assert out['stage']['reason'] in ('live-missing-or-unverifiable',) and live_source(world) == KEYS[0]
+    assert out['stage']['reason'] == 'initial-publication-authorized' and live_source(world) == KEYS[0]
 
 
 def test_runner_interrupted_during_acquisition_keeps_the_reservation_charged(world):
@@ -296,7 +297,7 @@ def test_expired_pilot_refuses_even_when_the_disable_call_fails_and_never_resume
     for _ in range(3):
         out = run_once(world)
         assert out['guard']['reason'] == 'expired' and out['guard']['stop'] and not out['guard']['acquire']
-        assert out['jobs']['stop'] == 'failure' and 'publish' not in out['jobs']
+        assert out['jobs']['stop'] == 'failure' and 'acquire' not in out['jobs'] and 'stage' not in out['jobs']
     assert world.archive.requests == []
     with pytest.raises(pilot.Refusal, match='expired'):  # the publish job re-checks independently
         pilot.acquire(world.checkout('p'), now_fn=world.now, enabled='true', public_b64=world.public_b64,
@@ -477,7 +478,7 @@ def test_neutral_runs_do_not_reset_the_streak(world):
 def test_cancelled_runs_count_as_failures(world):
     put(world, KEYS[0])
     for _ in range(3):
-        assert run_once(world, cancel_publish=True)['conclusion'] == 'cancelled'
+        assert run_once(world, cancel_after_acquire=True)['conclusion'] == 'cancelled'
     assert run_once(world)['guard']['reason'] == 'consecutive-failures'
 
 
@@ -486,7 +487,7 @@ def test_cancelled_runs_count_as_failures(world):
     ([{'id': 1, 'run_number': 1, 'status': 'waiting', 'conclusion': None}], {}, 'uncertain'),
     ([{'id': 1, 'run_number': 1, 'status': 'completed', 'conclusion': 'action_required'}], {}, 'uncertain'),
     ([{'id': 1, 'run_number': 1, 'status': 'completed', 'conclusion': 'stale'}], {}, 'uncertain'),
-    ([{'id': 1, 'run_number': 1, 'status': 'completed', 'conclusion': 'success'}], {1: [{'name': 'publish', 'conclusion': 'failure'}]}, 'uncertain'),
+    ([{'id': 1, 'run_number': 1, 'status': 'completed', 'conclusion': 'success'}], {1: [{'name': 'stage', 'conclusion': 'failure'}]}, 'uncertain'),
     ([{'id': 1, 'run_number': 1, 'status': 'completed'}], {}, 'uncertain'),
     ([{'id': 1, 'run_number': 1, 'status': 'completed', 'conclusion': 'timed_out'},
       {'id': 2, 'run_number': 2, 'status': 'completed', 'conclusion': 'startup_failure'}], {}, 2),
@@ -583,20 +584,49 @@ def test_every_action_is_pinned_to_a_full_commit():
     assert uses and all(re.fullmatch(r'actions/[a-z-]+@[0-9a-f]{40}', u) for u in uses), uses
 
 
+def scoped(block):
+    section = block.split('permissions:\n', 1)[1]
+    return dict(re.findall(r'^      ([a-z-]+): (read|write)$', re.split(r'\n    (?=\S)', section, maxsplit=1)[0], re.M))
+
+
+def condition(block):
+    m = re.search(r'\n    if: (>-\n(?:      .*\n)+|.*\n)', block)
+    return ' '.join(m[1].replace('>-', '').split()) if m else None
+
+
 def test_least_privilege_per_job():
     _, jobs = jobs_text()
-    def scoped(name):
-        section = jobs[name].split('permissions:\n', 1)[1]
-        return dict(re.findall(r'^      ([a-z-]+): (read|write)$', re.split(r'\n    (?=\S)', section, maxsplit=1)[0], re.M))
-    assert scoped('guard') == {'contents': 'read', 'actions': 'read'}
-    assert scoped('publish') == {'contents': 'write'}
-    assert scoped('deploy') == {'contents': 'read', 'pages': 'write', 'id-token': 'write'}
-    assert scoped('stop') == {'actions': 'write'}
-    for name, block in jobs.items():
-        has_secrets = 'secrets.' in block
-        assert has_secrets == (name == 'publish'), name
-    assert 'actions: write' not in jobs['publish'] + jobs['deploy'] + jobs['guard']
+    assert set(jobs) == {'guard', 'acquire', 'stage', 'deploy', 'stop'}
+    assert scoped(jobs['guard']) == {'contents': 'read', 'actions': 'read'}
+    assert scoped(jobs['acquire']) == {'contents': 'write'}
+    assert scoped(jobs['stage']) == {'contents': 'read'}
+    assert scoped(jobs['deploy']) == {'contents': 'read', 'pages': 'write', 'id-token': 'write'}
+    assert scoped(jobs['stop']) == {'actions': 'write'}
+    secrets = {name: set(re.findall(r'secrets\.([A-Z0-9_]+)', block)) for name, block in jobs.items()}
+    assert secrets == {'guard': set(), 'acquire': {'IR019B_SIGNING_KEY', 'PRODUCER_READ_DEPLOY_KEY'},
+                       'stage': {'PRODUCER_READ_DEPLOY_KEY'}, 'deploy': set(), 'stop': set()}
     assert 'uses:' not in jobs['stop'] and 'environment:' in jobs['deploy']
+    assert 'persist-credentials: false' in jobs['stage'] and 'persist-credentials: false' in jobs['deploy']
+
+
+def test_workflow_conditions_give_recovery_a_path_and_block_unverified_deployment():
+    """The YAML conditions are the ones run_once simulates (C: failed-job recovery)."""
+    _, jobs = jobs_text()
+    assert re.search(r'needs: guard\n', jobs['acquire']) and condition(jobs['acquire']) == "needs.guard.outputs.acquire == 'true'"
+    assert 'needs: [guard, acquire]' in jobs['stage']
+    assert condition(jobs['stage']) == ("${{ !cancelled() && needs.guard.result == 'success' && needs.guard.outputs.deploy == 'true' "
+                                        "&& contains(fromJSON('[\"success\",\"failure\",\"skipped\"]'), needs.acquire.result) }}")
+    assert 'needs: stage\n' in jobs['deploy']
+    assert condition(jobs['deploy']) == ("${{ !cancelled() && needs.stage.result == 'success' && needs.stage.outputs.deploy == 'true' "
+                                         "&& vars.PUBLICATION_ENABLED == 'true' }}")
+    # Deploy outputs come only from a SUCCESSFUL stage job; nothing reads outputs of a failed job.
+    assert 'needs.acquire.outputs' not in jobs['stage'] + jobs['deploy']
+    # stage deploys remote main after verification (pilot.stage syncs), never the acquire job's working files.
+    assert 'ops/pilot.py stage' in jobs['stage'] and 'IR019B_SIGNING_KEY' not in jobs['stage']
+    steps = jobs['deploy'].split('\n      - ')
+    order = [i for i, st in enumerate(steps) for marker in ('pilot.py preflight', 'deploy-pages@', 'pilot.py probe') if marker in st]
+    assert order == sorted(order) and len(order) == 3
+    assert condition(jobs['stop']) == "needs.guard.outputs.stop == 'true'"
 
 
 def test_python_dependencies_are_hash_locked_and_installed_as_wheels_only():
@@ -609,3 +639,282 @@ def test_python_dependencies_are_hash_locked_and_installed_as_wheels_only():
     text, _ = jobs_text()
     assert "--require-hashes --only-binary ':all:' --no-deps -r ops/requirements.lock" in text
     assert 'pip install -e' not in text
+
+
+# ================================================================== Gate 2.1 targeted corrections
+
+def stage_now(w, **kw):
+    return pilot.stage(w.checkout('stage-direct'), public_b64=w.public_b64, enabled='true', now=w.now(),
+                       live_index_url='https://example.invalid/kinx/index.json', fetch=w.pages.fetch, **kw)
+
+
+def resign(index_bytes: bytes, key_path: Path, **changes) -> bytes:
+    """An authenticated index for the same package with altered payload fields (test-only key)."""
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    env = json.loads(index_bytes)
+    payload = json.loads(base64.b64decode(env['payload']))
+    payload.update(changes)
+    raw = pub.canonical(payload)
+    env['payload'] = base64.b64encode(raw).decode()
+    env['signature'] = base64.b64encode(load_pem_private_key(key_path.read_bytes(), None).sign(raw)).decode()
+    return pub.canonical(env) + b'\n'
+
+
+# --- A: the live state must be authenticated before anything replaces it
+
+def test_A_absent_index_deploys_only_with_explicit_initial_publication_allowance(tmp_path, monkeypatch):
+    w = make_world(tmp_path, allowInitialPublication=False)
+    install(w, monkeypatch)
+    put(w, KEYS[0])
+    out = run_once(w)
+    assert out['acquire']['status'] == 'published' and out['stage']['reason'] == 'live-index-absent'
+    assert out['jobs']['stage'] == 'failure' and 'deploy' not in out['jobs'] and live_source(w) is None
+
+
+def test_A_owner_unpublished_site_is_not_silently_republished(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.fail_next = 1
+    run_once(world)                                   # committed K1, live K0
+    world.pages.unpublished = True                    # owner: Settings -> Pages -> Unpublish
+    c = world.checkout('auth')                        # pilot authorized without initial-publication allowance
+    a = json.loads((c / 'pilot/authorization.json').read_text())
+    a['allowInitialPublication'] = False
+    (c / 'pilot/authorization.json').write_text(json.dumps(a))
+    git('-c', 'user.name=o', '-c', 'user.email=o@o', 'commit', '--quiet', '-am', 'no initial', cwd=c)
+    git('push', '--quiet', 'origin', 'main', cwd=c)
+    deployments = world.pages.deployments
+    out = run_once(world)
+    assert out['stage']['reason'] == 'live-index-absent' and world.pages.deployments == deployments
+
+
+def test_A_authenticated_older_live_is_recovered(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.fail_next = 1
+    run_once(world)
+    r = stage_now(world)
+    assert (r['liveState'], r['deploy'], r['reason']) == ('older', True, 'committed-newer-than-live')
+
+
+def test_A_authenticated_matching_observation_with_different_bytes_is_not_redeployed(world):
+    put(world, KEYS[0])
+    run_once(world)
+    live = world.pages.fetch('x')
+    world.pages.origin_body = resign(live, world.signing, publishedUtc='2026-10-30T15:59:59+00:00')
+    r = stage_now(world)
+    assert (r['liveState'], r['deploy']) == ('matching', False)
+
+
+def test_A_authenticated_newer_live_refuses(world):
+    put(world, KEYS[0])
+    run_once(world)
+    live = json.loads(base64.b64decode(json.loads(world.pages.fetch('x'))['payload']))['latest']
+    world.pages.origin_body = resign(world.pages.fetch('x'), world.signing, latest={
+        **live, 'observationStartUtc': '2026-10-30T16:30:00+00:00', 'observationEndUtc': '2026-10-30T16:36:00+00:00',
+        'sourceSHA256': 'f' * 64})
+    with pytest.raises(pilot.Failure, match='live-newer-than-committed'):
+        stage_now(world)
+
+
+def test_A_unreachable_endpoint_fails_without_deploying_and_recovers_later(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.unreachable = True
+    deployments = world.pages.deployments
+    out = run_once(world)
+    assert out['acquire']['status'] == 'published' and out['stage']['reason'] == 'live-index-unreachable'
+    assert out['jobs']['stage'] == 'failure' and world.pages.deployments == deployments and out['conclusion'] == 'failure'
+    world.pages.unreachable = False
+    out = run_once(world)                             # no newer volume; authenticated older live -> recovery
+    assert out['stage']['reason'] == 'committed-newer-than-live' and live_source(world) == KEYS[1]
+
+
+@pytest.mark.parametrize('tamper', ['bad-signature', 'foreign-key', 'garbage', 'oversized', 'overlapping'])
+def test_A_invalid_or_unverifiable_live_index_fails_without_deploying(world, tmp_path, tamper):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.fail_next = 1
+    run_once(world)                                   # committed K1 ahead of live K0: recovery would be wanted
+    live = world.pages.fetch('x')
+    if tamper == 'bad-signature':
+        env = json.loads(live)
+        sig = bytearray(base64.b64decode(env['signature'])); sig[0] ^= 1
+        env['signature'] = base64.b64encode(bytes(sig)).decode()
+        body = json.dumps(env).encode()
+    elif tamper == 'foreign-key':
+        pub.keygen(tmp_path / 'foreign.pem')
+        body = resign(live, tmp_path / 'foreign.pem')
+    elif tamper == 'garbage':
+        body = b'<html>Site not found</html>'
+    elif tamper == 'oversized':
+        body = b' ' * (70 << 10)
+    else:                                             # authentic but chronology neither older nor newer
+        latest = json.loads(base64.b64decode(json.loads(live)['payload']))['latest']
+        committed = json.loads(base64.b64decode(json.loads((world.checkout('c') / 'site/kinx/index.json').read_bytes())['payload']))['latest']
+        body = resign(live, world.signing, latest={**latest, 'observationEndUtc': '2026-10-30T16:30:00+00:00',
+                                                   'observationStartUtc': latest['observationStartUtc']})
+        assert pilot.utc(committed['observationEndUtc']) < pilot.utc('2026-10-30T16:30:00+00:00')
+    world.pages.origin_body = body
+    deployments = world.pages.deployments
+    out = run_once(world)
+    assert out['stage']['reason'] == 'live-index-unverifiable' and out['jobs']['stage'] == 'failure'
+    assert world.pages.deployments == deployments
+
+
+def test_A_stale_cdn_plain_response_is_reported_not_mistaken_for_the_origin(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    run_once(world)
+    world.pages.stale_plain = True                    # plain URL still serves K0, origin serves K1
+    r = stage_now(world)
+    assert (r['liveState'], r['deploy'], r['plainURLServesCommitted']) == ('matching', False, False)
+
+
+# --- B: public visibility must be demonstrated
+
+def test_B_unconfirmed_visibility_fails_the_run_and_the_next_run_does_not_redeploy(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.stale_plain = True
+    out = run_once(world)
+    assert out['probe']['outcome'] == 'origin-only-cdn-stale' and out['jobs']['deploy'] == 'failure'
+    assert out['conclusion'] == 'failure'             # not healthy merely because the deployment was accepted
+    deployments = world.pages.deployments
+    world.pages.stale_plain = False                   # CDN catches up
+    out = run_once(world)
+    assert out['stage']['reason'] == 'live-matches-committed' and world.pages.deployments == deployments
+    assert out['conclusion'] == 'success'
+
+
+def test_B_three_unconfirmed_publications_stop_the_pilot(world):
+    world.pages.stale_plain = True
+    for k in KEYS[:3]:
+        put(world, k)
+        assert run_once(world)['jobs']['deploy'] == 'failure'
+    assert run_once(world)['guard']['reason'] == 'consecutive-failures'
+
+
+def test_B_probe_waits_for_legitimate_propagation_then_succeeds():
+    t, served = [0.0], iter([None, b'old', b'old', b'new', b'new', b'new'])
+    expected = pilot.sha256(b'new')
+    def fetch(url, bust=True):
+        return next(served)
+    r = pilot.probe('u', expected, fetch=fetch, timeout_s=150, interval_s=10, clock=lambda: t[0],
+                    sleep=lambda s: t.__setitem__(0, t[0] + s))
+    assert r['outcome'] == 'visible' and r['afterSeconds'] == 20
+
+
+@pytest.mark.parametrize('origin,plain,outcome', [(b'new', b'old', 'origin-only-cdn-stale'), (b'old', b'old', 'not-visible'),
+                                                  (None, None, 'not-visible'), (OSError, OSError, 'not-visible')])
+def test_B_probe_outcomes_within_the_bound(origin, plain, outcome):
+    t = [0.0]
+    def fetch(url, bust=True):
+        body = origin if bust else plain
+        if body is OSError:
+            raise OSError('down')
+        return body
+    r = pilot.probe('u', pilot.sha256(b'new'), fetch=fetch, timeout_s=150, interval_s=10, clock=lambda: t[0],
+                    sleep=lambda s: t.__setitem__(0, t[0] + s))
+    assert (r['visible'], r['outcome']) == (False, outcome) and r['afterSeconds'] <= 150
+
+
+def test_B_cli_probe_exits_nonzero_when_visibility_is_unconfirmed(monkeypatch, capsys):
+    monkeypatch.setattr(pilot, 'fetch_url', lambda url, bust=True, **k: b'old')
+    monkeypatch.setattr(pilot.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(pilot.probe, '__defaults__', (pilot.fetch_url, 0, 10, pilot.time.monotonic, lambda s: None))
+    assert pilot.main(['probe', '--url', 'https://x/kinx/index.json', '--expect-sha256', pilot.sha256(b'new')]) == 1
+    assert 'public visibility unconfirmed' in capsys.readouterr().out
+
+
+# --- C: recovery has a path after failed acquisition, and failed work never becomes deployable
+
+def test_C_recovery_runs_after_a_failed_scientific_validation_and_deploys_only_the_committed_publication(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.fail_next = 1
+    run_once(world)                                   # committed K1, live K0
+    put(world, KEYS[2])
+
+    def bad_science(key, size, root, discovered):
+        r = world.fake_produce(key, size, root, discovered)
+        p = json.loads((root / r['package']).read_text())
+        p['descriptor']['numericalPolicyID'] = 'irvol-v1-altered'
+        (root / r['package']).write_text(json.dumps(p))
+        return r
+    out = run_once(world, produce=bad_science)
+    assert out['jobs']['acquire'] == 'failure' and out['jobs']['stage'] == 'success' and out['jobs']['deploy'] == 'success'
+    assert live_source(world) == committed_source(world) == KEYS[1]          # K2 (failed science) never deployable
+    assert out['conclusion'] == 'failure'                                    # the failed acquisition still counts
+
+
+@pytest.mark.parametrize('failure', ['missing-key', 'listing'])
+def test_C_recovery_runs_after_failed_signing_material_or_archive(world, tmp_path, failure):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.fail_next = 1
+    run_once(world)
+    if failure == 'missing-key':
+        world.signing = tmp_path / 'absent.pem'
+    else:
+        world.archive.list_error = OSError('down')
+    out = run_once(world)
+    assert out['jobs']['acquire'] == 'failure' and out['stage']['reason'] == 'committed-newer-than-live'
+    assert live_source(world) == KEYS[1]
+
+
+def test_C_unverified_committed_site_is_never_deployable(world):
+    put(world, KEYS[0])
+    run_once(world)
+    put(world, KEYS[1])
+    world.pages.fail_next = 1
+    run_once(world)
+    c = world.checkout('tamper')                      # a corrupted package lands on main (e.g. a bad manual commit)
+    pkg = next((c / 'site/kinx/packages').glob('*.irradar'))
+    pkg.write_bytes(pkg.read_bytes()[:-10] + b'0123456789')
+    git('-c', 'user.name=o', '-c', 'user.email=o@o', 'commit', '--quiet', '-am', 'tamper', cwd=c)
+    git('push', '--quiet', 'origin', 'main', cwd=c)
+    deployments = world.pages.deployments
+    out = run_once(world)
+    assert out['stage']['reason'] == 'committed-site-invalid' and world.pages.deployments == deployments
+    assert live_source(world) == KEYS[0]
+
+
+def test_C_cancelled_run_does_not_stage_or_deploy(world):
+    put(world, KEYS[0])
+    out = run_once(world, cancel_after_acquire=True)
+    assert 'stage' not in out['jobs'] and 'deploy' not in out['jobs'] and live_source(world) is None
+
+
+# --- shutdown semantics at the deployment boundary
+
+def test_kill_switch_flipped_after_stage_skips_deployment(world):
+    put(world, KEYS[0])
+    world.enabled_at_deploy = 'false'
+    out = run_once(world)
+    assert out['jobs']['stage'] == 'success' and 'deploy' not in out['jobs'] and live_source(world) is None
+
+
+def test_expiry_reached_between_stage_and_deploy_blocks_deployment(world):
+    put(world, KEYS[0])
+    world.pages.fail_next = 1
+    run_once(world)                                   # committed K0, nothing live: stage will want to deploy
+    world.clock[0] = T0 + timedelta(hours=47, minutes=58)
+    world.deploy_delay = timedelta(minutes=3)         # the deploy job starts after the window closed
+    out = run_once(world)
+    assert out['stage']['deploy'] is True
+    assert out['preflight'] == {'refused': 'expired'} and out['jobs']['deploy'] == 'failure'
+    assert world.pages.deployments == 0
+
+
+def test_cli_preflight_refusal_exits_nonzero(world, monkeypatch):
+    monkeypatch.setenv('PUBLICATION_ENABLED', 'false')
+    assert pilot.main(['preflight', '--repo', str(world.checkout('pf'))]) == 1

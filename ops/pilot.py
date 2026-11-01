@@ -5,14 +5,16 @@ with the operational controls an unattended schedule needs. Nothing here changes
 index, or the native client.
 
 Commands (one per workflow job; see .github/workflows/publish-kinx-scheduled.yml):
-    guard    stdlib only, no secrets. Kill switch, owner authorization window, cross-run failure accounting
-             (GitHub Actions API, fail closed), cumulative source and repository budgets. Decides what may run.
-    acquire  at most ONE NOAA object: list once; if newer, push a budget reservation to `main` (compare-and-swap)
-             BEFORE any object byte is requested; then produce, sign, prune, verify, and push the publication.
-    stage    sync to remote `main`, verify the whole committed site, compare with the live Pages index and
-             decide whether to deploy it (recovers a failed deployment without a new acquisition; never deploys
-             an older observation over a newer live one).
-    probe    after deployment: bounded check that the public index serves exactly the committed bytes.
+    guard      stdlib only, no secrets. Kill switch, owner authorization window, cross-run failure accounting
+               (GitHub Actions API, fail closed), cumulative source and repository budgets. Decides what may run.
+    acquire    signing key. At most ONE NOAA object: list once; if newer, push a budget reservation to `main`
+               (compare-and-swap) BEFORE any object byte is requested; then produce, sign, prune, verify, push.
+    stage      no signing key; runs whether `acquire` succeeded, failed or was skipped. Syncs to remote `main`,
+               verifies the whole committed site, authenticates the live index, and deploys only over an
+               authenticated OLDER observation (failed-deployment recovery) or an owner-allowed initial absence.
+               Unreachable, unverifiable or newer live state fails without deploying.
+    preflight  deploy job, immediately before deploy-pages: kill switch and authorization window again.
+    probe      after deployment: the run fails unless origin AND the plain URL serve exactly the deployed index.
 
 Hard limits are enforced from files committed on `main` (owner authorization + append-only ledger), never from
 mutable runner state, so they survive failed, cancelled and interrupted runs.
@@ -101,6 +103,7 @@ class Authorization:
     max_repository_bytes: int
     repository_baseline_bytes: int
     workflow_file: str
+    allow_initial_publication: bool = False
 
     @staticmethod
     def load(repo: Path) -> 'Authorization':
@@ -111,7 +114,8 @@ class Authorization:
                 pilot_id=a['pilotId'], not_before=utc(a['notBeforeUtc']), expires=utc(a['expiresUtc']),
                 max_objects=int(a['maxSourceObjects']), max_source_bytes=int(a['maxSourceBytes']),
                 max_repository_bytes=int(a['maxRepositoryBytes']),
-                repository_baseline_bytes=int(a['repositoryBaselineBytes']), workflow_file=a['workflowFile'])
+                repository_baseline_bytes=int(a['repositoryBaselineBytes']), workflow_file=a['workflowFile'],
+                allow_initial_publication=a.get('allowInitialPublication', False))
             ok = (a.get('format'), a.get('version')) == ('ir023-pilot-authorization', 1)
         except FileNotFoundError:
             raise Refusal('authorization-missing', str(AUTHORIZATION), stop=True)
@@ -132,6 +136,8 @@ class Authorization:
             problems.append('repository bytes')
         if not re.fullmatch(r'[a-z0-9-]+\.yml', auth.workflow_file):
             problems.append('workflowFile')
+        if not isinstance(auth.allow_initial_publication, bool):
+            problems.append('allowInitialPublication')
         if problems:
             raise Refusal('authorization-invalid', ', '.join(problems), stop=True)
         return auth
@@ -205,11 +211,13 @@ def acquisition_headroom(auth: Authorization, totals: Totals, next_source_bytes:
 # ---------------------------------------------------------------- cross-run failure accounting
 
 def consecutive_failures(api, repo_slug: str, workflow_file: str, run_id: int, run_number: int,
-                         since: datetime, jobs_name: str = 'publish', limit: int = MAX_CONSECUTIVE_FAILURES) -> int:
+                         since: datetime, jobs_name: str = 'stage', limit: int = MAX_CONSECUTIVE_FAILURES) -> int:
     """Counts failed executions since the last healthy one, newest first, within this authorization window.
 
-    healthy  run concluded success AND its `publish` job concluded success (a no-newer listing is healthy)
-    neutral  run concluded success/skipped/neutral with `publish` skipped (kill switch off, refusals); does not reset
+    healthy  run concluded success AND its `stage` job concluded success. `stage` runs on every operable run, so a
+             healthy run had acquisition (or no-newer), verification, the live comparison and any deployment + public
+             visibility probe all succeed
+    neutral  run concluded success/skipped/neutral with `stage` skipped (kill switch off, refusals); does not reset
     failure  failure, timed_out, startup_failure; cancelled once any job had started (an interruption is not health)
     superseded  cancelled before any job started (a pending run replaced in the concurrency group): neutral
     anything else (incomplete earlier run, unknown conclusion, malformed or unavailable API) -> Uncertain
@@ -242,12 +250,12 @@ def consecutive_failures(api, repo_slug: str, workflow_file: str, run_id: int, r
                         return count
             elif conclusion == 'success':
                 listed = _jobs(api, repo_slug, rid)
-                publish = [j for j in listed if j.get('name') == jobs_name]
-                state = publish[0].get('conclusion') if publish else 'skipped'
+                named = [j for j in listed if j.get('name') == jobs_name]
+                state = named[0].get('conclusion') if named else 'skipped'
                 if state == 'success':
                     return count
                 if state != 'skipped':
-                    raise Uncertain(f'run {rid} succeeded but publish job is {state}')
+                    raise Uncertain(f'run {rid} succeeded but {jobs_name} job is {state}')
             elif conclusion in NEUTRAL_CONCLUSIONS:
                 continue
             else:
@@ -499,62 +507,107 @@ def fetch_url(url: str, limit: int = 64 << 10, timeout: float = 15, bust: bool =
         raise
 
 
-def stage(repo: Path, *, public_b64: str, live_index_url: str, fetch=fetch_url, sync: bool = True) -> dict:
+def classify_live(committed_bytes: bytes, committed: dict, public: bytes, url: str, fetch) -> tuple[str, dict]:
+    """State of the currently published observation, from the origin (cache-busted) response; the plain URL the
+    headset requests is recorded separately so a stale CDN copy is reported, never mistaken for the origin.
+
+    absent        HTTP 404 for the index
+    matching      identical bytes, or an authenticated index naming the same source observation
+    older         authenticated, strictly older observation (start and end)
+    newer         authenticated, strictly newer observation
+    unreachable   network error, timeout, or any non-404 HTTP error
+    unverifiable  oversized, malformed, wrong key, bad signature, or chronology that is neither older nor newer
+    """
     from immersive_radar_pipeline import publish as pub
     from immersive_radar_pipeline.fetch import IntegrityError
+    detail = {}
+    try:
+        plain = fetch(url, bust=False)
+        detail['plainURLServesCommitted'] = plain == committed_bytes
+    except Exception as exc:
+        detail['plainURLServesCommitted'] = f'error: {type(exc).__name__}'
+    try:
+        body = fetch(url)
+    except Exception as exc:
+        return 'unreachable', {**detail, 'liveError': f'{type(exc).__name__}: {exc}'}
+    if body is None:
+        return 'absent', detail
+    if body == committed_bytes:
+        return 'matching', detail
+    try:
+        live = pub.open_index(body, public)['latest']
+    except (IntegrityError, ValueError, KeyError, TypeError) as exc:
+        return 'unverifiable', {**detail, 'liveError': f'{type(exc).__name__}: {exc}'}
+    detail['liveSourceKey'] = live['sourceKey']
+    if live['sourceSHA256'] == committed['latest']['sourceSHA256']:
+        return 'matching', detail
+    if observation_newer(live, committed['latest']):
+        return 'newer', detail
+    if observation_newer(committed['latest'], live):
+        return 'older', detail
+    return 'unverifiable', {**detail, 'liveError': 'overlapping chronology'}
+
+
+def stage(repo: Path, *, public_b64: str, live_index_url: str, enabled: str | None, now: datetime,
+          fetch=fetch_url, sync: bool = True) -> dict:
+    """Deploy committed `main` only when the live publication is AUTHENTICATED and strictly older (failed-deployment
+    recovery), or genuinely absent with explicit owner allowance. Every uncertain state fails without deploying."""
+    check_kill_switch(enabled)
+    auth = Authorization.load(repo)
+    check_window(auth, now)
     if sync:
         Git(repo).sync()  # deploy exactly what `main` holds, never a partial working tree
+        auth = Authorization.load(repo)
+        check_window(auth, now)
     site = repo / KINX
     if not (site / 'index.json').exists():
         return {'deploy': False, 'reason': 'nothing-committed'}
     public = load_public(public_b64)
     committed = verify_site(site, public)
     committed_bytes = (site / 'index.json').read_bytes()
-    try:
-        live_bytes = fetch(live_index_url)
-    except Exception as exc:
-        live_bytes, unreachable = None, f'{type(exc).__name__}: {exc}'
-    else:
-        unreachable = None
-    result = {'committedIndexSHA256': sha256(committed_bytes), 'committedSourceKey': committed['latest']['sourceKey']}
-    if live_bytes == committed_bytes:
+    state, detail = classify_live(committed_bytes, committed, public, live_index_url, fetch)
+    result = {'committedIndexSHA256': sha256(committed_bytes), 'committedSourceKey': committed['latest']['sourceKey'],
+              'liveState': state, **detail}
+    if state == 'matching':
         return {**result, 'deploy': False, 'reason': 'live-matches-committed'}
-    live = None
-    if live_bytes is not None:
-        try:
-            live = pub.open_index(live_bytes, public)
-        except (IntegrityError, ValueError, KeyError):
-            live = None
-    if live is not None:
-        result['liveSourceKey'] = live['latest']['sourceKey']
-        if observation_newer(live['latest'], committed['latest']):
-            raise Failure('live-newer-than-committed', 'refusing to deploy an older observation over a newer one')
-        if live['latest']['sourceSHA256'] == committed['latest']['sourceSHA256']:
-            return {**result, 'deploy': False, 'reason': 'live-same-observation'}
+    if state == 'older':
         return {**result, 'deploy': True, 'reason': 'committed-newer-than-live'}
-    return {**result, 'deploy': True, 'reason': 'live-unreachable' if unreachable else 'live-missing-or-unverifiable',
-            **({'liveError': unreachable} if unreachable else {})}
+    if state == 'absent':
+        if auth.allow_initial_publication:
+            return {**result, 'deploy': True, 'reason': 'initial-publication-authorized'}
+        raise Failure('live-index-absent', 'no live index and the authorization does not allow an initial publication '
+                      '(an unpublished site may be an owner shutdown)')
+    if state == 'newer':
+        raise Failure('live-newer-than-committed', 'refusing to deploy an older observation over a newer one')
+    raise Failure(f'live-index-{state}', detail.get('liveError', ''))
 
 
-def probe(url: str, expected_sha256: str, *, fetch=fetch_url, timeout_s: float = 90, interval_s: float = 10,
+def preflight(repo: Path, *, enabled: str | None, now: datetime) -> dict:
+    """Deploy job, immediately before deploy-pages: kill switch and authorization window again (no extra permission)."""
+    check_kill_switch(enabled)
+    check_window(Authorization.load(repo), now)
+    return {'deployAuthorized': True, 'checkedUtc': iso(now)}
+
+
+def probe(url: str, expected_sha256: str, *, fetch=fetch_url, timeout_s: float = 150, interval_s: float = 10,
           clock=time.monotonic, sleep=time.sleep) -> dict:
+    """Healthy only when BOTH the origin (cache-busted) and the plain URL the headset requests serve exactly the deployed
+    index bytes within the bounded window. A deployment request GitHub accepted is not evidence of public visibility."""
     start = clock()
     while True:
-        try:
-            body = fetch(url)
-            seen = sha256(body) if body is not None else None
-        except Exception as exc:
-            seen = f'error: {type(exc).__name__}'
-        if seen == expected_sha256:
-            result = {'visible': True, 'afterSeconds': round(clock() - start, 1), 'visibleUtc': iso(datetime.now(timezone.utc))}
-            try:  # what the headset requests: the plain URL, which a CDN may still hold for up to max-age
-                plain = fetch(url, bust=False)
-                result['plainURLServesCommitted'] = plain is not None and sha256(plain) == expected_sha256
+        seen = {}
+        for name, bust in (('origin', True), ('plain', False)):
+            try:
+                body = fetch(url, bust=bust)
+                seen[name] = sha256(body) if body is not None else 'absent'
             except Exception as exc:
-                result['plainURLServesCommitted'] = f'error: {type(exc).__name__}'
-            return result
+                seen[name] = f'error: {type(exc).__name__}'
+        elapsed = round(clock() - start, 1)
+        if seen['origin'] == expected_sha256 and seen['plain'] == expected_sha256:
+            return {'outcome': 'visible', 'visible': True, 'afterSeconds': elapsed, 'visibleUtc': iso(datetime.now(timezone.utc))}
         if clock() - start + interval_s > timeout_s:
-            return {'visible': False, 'lastSeen': seen, 'afterSeconds': round(clock() - start, 1)}
+            outcome = 'origin-only-cdn-stale' if seen['origin'] == expected_sha256 else 'not-visible'
+            return {'outcome': outcome, 'visible': False, 'afterSeconds': elapsed, 'lastSeen': seen}
         sleep(interval_s)
 
 
@@ -575,7 +628,7 @@ def _emit(result: dict, outputs: dict):
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('command', choices=['guard', 'acquire', 'stage', 'probe'])
+    p.add_argument('command', choices=['guard', 'acquire', 'stage', 'preflight', 'probe'])
     p.add_argument('--repo', type=Path, default=Path('.'))
     p.add_argument('--work', type=Path)
     p.add_argument('--signing-key', type=Path)
@@ -596,17 +649,21 @@ def main(argv=None) -> int:
                         attempt=int(env.get('GITHUB_RUN_ATTEMPT', '1')))
             _emit(r, {'status': r['status']})
         elif a.command == 'stage':
-            r = stage(a.repo, public_b64=env['PUBLIC_KEY'], live_index_url=a.url)
+            r = stage(a.repo, public_b64=env['PUBLIC_KEY'], live_index_url=a.url, enabled=env.get('PUBLICATION_ENABLED'),
+                      now=now())
             _emit(r, {'deploy': r['deploy'], 'index_sha256': r.get('committedIndexSHA256', '')})
+        elif a.command == 'preflight':
+            _emit(preflight(a.repo, enabled=env.get('PUBLICATION_ENABLED'), now=now()), {'authorized': True})
         else:
             r = probe(a.url, a.expect_sha256)
-            _emit(r, {'visible': r['visible']})
-            if not r['visible']:
-                print(f'::warning::Deployed index not yet served at {a.url} after {r["afterSeconds"]} s')
+            _emit(r, {'visible': r['visible'], 'outcome': r['outcome']})
+            if not r['visible']:  # the run fails and counts toward the consecutive-failure stop
+                print(f'::error::public visibility unconfirmed ({r["outcome"]}) after {r["afterSeconds"]} s')
+                return 1
         return 0
     except Refusal as r:
         _emit({'status': 'refused', 'reason': r.code, 'detail': r.detail, 'stop': r.stop}, {'status': 'refused'})
-        return 0
+        return 1 if a.command == 'preflight' else 0  # a refused deployment must not look like a deployed one
     except Failure as f:
         _emit({'status': 'failed', 'reason': f.code, 'detail': f.detail}, {'status': 'failed'})
         print(f'::error::{f.code}: {f.detail}')

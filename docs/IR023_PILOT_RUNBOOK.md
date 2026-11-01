@@ -6,15 +6,22 @@ Everything below works from the GitHub web UI or `gh` on any machine. None of it
 
 ## Stop now
 
-Each step works on its own. Run them in order.
+**For an emergency shutdown, do all three steps.** The kill switch blocks the next authorized work, but it can't
+interrupt a runner that is already working. Only cancelling a run does that.
 
-1. **Kill switch** (no code change; takes effect at the next job start):
+| Control | What it stops | What it does NOT stop |
+|---|---|---|
+| Kill switch `PUBLICATION_ENABLED` ≠ `true` | Every job that starts after the change: the guard refuses, `acquire` and `stage` re-check it, the `deploy` job is skipped, and `preflight` re-checks it immediately before deploy-pages | A job already past its check, e.g. an `acquire` that is downloading or a `deploy-pages` call already in progress. Job environment values are fixed when the job starts. |
+| Disable workflow | Creation of new scheduled runs | Runs already queued or running |
+| Cancel run | The run in progress (each job is cancelled; nothing further is deployed) | Work already pushed to `main` or already deployed (both are verified, valid publications) |
+
+1. **Kill switch:**
    ```bash
    gh variable set PUBLICATION_ENABLED --body false -R xBR533/immersive-radar-publication
    ```
-   Web: repository → Settings → Secrets and variables → Actions → Variables → `PUBLICATION_ENABLED` → set to `false`.
-   Any value other than exactly `true` stops acquisition and deployment.
-2. **Disable the workflow** (no new runs are created):
+   Web: repository → Settings → Secrets and variables → Actions → Variables → `PUBLICATION_ENABLED` → `false`.
+   Any value other than exactly `true` is "off".
+2. **Disable the workflow:**
    ```bash
    gh workflow disable publish-kinx-scheduled.yml -R xBR533/immersive-radar-publication
    ```
@@ -26,10 +33,17 @@ Each step works on its own. Run them in order.
    ```bash
    gh run cancel <run-id> -R xBR533/immersive-radar-publication
    ```
-   A run cancelled mid-acquisition keeps its reservation charged in the ledger. Its partial work is never committed or deployed.
-4. **Confirm it stopped:** `gh run list …` shows no new run after the next 5-minute mark, and `gh workflow list --all -R xBR533/immersive-radar-publication` shows the workflow `disabled_manually`.
+   A run cancelled mid-acquisition keeps its reservation charged in the ledger. Its partial files are never committed or deployed.
+4. **Confirm:** after the next 5-minute mark, `gh run list …` shows no new or in-progress run, and
+   `gh workflow list --all -R xBR533/immersive-radar-publication` shows the workflow `disabled_manually`.
 
-The site keeps serving the last valid publication. The headset keeps its saved scans and shows STALE or offline truthfully.
+Worst case after step 1 alone: one run that had already passed its checks can finish one acquisition (≤ 64 MiB)
+and one deployment, within its job timeouts (acquire 8 min, stage 4 min, deploy 6 min).
+
+The site keeps serving the last valid publication, and the headset keeps its saved scans and shows STALE or offline
+truthfully. **Unpublishing Pages is also safe against the pilot.** If the live index is absent, the pilot refuses to
+republish it unless the authorization explicitly sets `allowInitialPublication: true`, and the Gate 3 authorization
+keeps that `false`.
 
 ## Credential compromise
 
@@ -47,6 +61,8 @@ The site keeps serving the last valid publication. The headset keeps its saved s
 | now ≥ `expiresUtc` | no acquisition or deployment; the isolated `stop` job disables the workflow | **never** (time only moves forward; a failed disable call changes nothing) |
 | 3 consecutive failed executions in the window | no acquisition; workflow disabled | never automatically: refusals don't count as healthy runs, so the streak stays |
 | Failure accounting unknown (API down, odd run state) | run fails, no acquisition | the outage runs count toward the 3-failure stop |
+| Live index unreachable, unverifiable, absent (without allowance) or newer than `main` | that run deploys nothing and fails | counts toward the 3-failure stop |
+| Deployed index not served by both origin and the plain URL within 150 s | the run fails (deployment accepted ≠ publicly visible) | the next run sees an origin match and doesn't redeploy; 3 in a row stop the pilot |
 | Source objects/bytes or repository bytes would exceed the ledger budget | no acquisition; already-committed work may still be deployed once; workflow disabled | never: the ledger only grows |
 | Authorization or ledger missing/invalid | no acquisition; workflow disabled | only after a new owner commit |
 
