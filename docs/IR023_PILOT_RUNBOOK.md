@@ -62,7 +62,7 @@ keeps that `false`.
 | 3 consecutive failed executions in the window | no acquisition; workflow disabled | never automatically: refusals don't count as healthy runs, so the streak stays |
 | Failure accounting unknown (API down, odd run state) | run fails, no acquisition | the outage runs count toward the 3-failure stop |
 | Live index unreachable, unverifiable, absent (without allowance) or newer than `main` | that run deploys nothing and fails | counts toward the 3-failure stop |
-| Deployed index not served by both origin and the plain URL within 150 s | the run fails (deployment accepted ≠ publicly visible) | the next run sees an origin match and doesn't redeploy; 3 in a row stop the pilot |
+| Deployed index not served by both origin and the plain URL within 150 s | the run fails (deployment accepted ≠ publicly visible) | later runs recheck the plain URL for ≤ 150 s without redeploying; each run fails until the plain URL serves an authenticated matching index, and 3 in a row stop the pilot |
 | Source objects/bytes or repository bytes would exceed the ledger budget | no acquisition; already-committed work may still be deployed once; workflow disabled | never: the ledger only grows |
 | Authorization or ledger missing/invalid | no acquisition; workflow disabled | only after a new owner commit |
 

@@ -507,51 +507,66 @@ def fetch_url(url: str, limit: int = 64 << 10, timeout: float = 15, bust: bool =
         raise
 
 
-def classify_live(committed_bytes: bytes, committed: dict, public: bytes, url: str, fetch) -> tuple[str, dict]:
-    """State of the currently published observation, from the origin (cache-busted) response; the plain URL the
-    headset requests is recorded separately so a stale CDN copy is reported, never mistaken for the origin.
-
-    absent        HTTP 404 for the index
-    matching      identical bytes, or an authenticated index naming the same source observation
-    older         authenticated, strictly older observation (start and end)
-    newer         authenticated, strictly newer observation
-    unreachable   network error, timeout, or any non-404 HTTP error
-    unverifiable  oversized, malformed, wrong key, bad signature, or chronology that is neither older nor newer
-    """
+def _classify(body: bytes | None, committed_bytes: bytes, committed: dict, public: bytes) -> tuple[str, dict]:
     from immersive_radar_pipeline import publish as pub
     from immersive_radar_pipeline.fetch import IntegrityError
-    detail = {}
-    try:
-        plain = fetch(url, bust=False)
-        detail['plainURLServesCommitted'] = plain == committed_bytes
-    except Exception as exc:
-        detail['plainURLServesCommitted'] = f'error: {type(exc).__name__}'
-    try:
-        body = fetch(url)
-    except Exception as exc:
-        return 'unreachable', {**detail, 'liveError': f'{type(exc).__name__}: {exc}'}
     if body is None:
-        return 'absent', detail
+        return 'absent', {}
     if body == committed_bytes:
-        return 'matching', detail
+        return 'matching', {}
     try:
         live = pub.open_index(body, public)['latest']
     except (IntegrityError, ValueError, KeyError, TypeError) as exc:
-        return 'unverifiable', {**detail, 'liveError': f'{type(exc).__name__}: {exc}'}
-    detail['liveSourceKey'] = live['sourceKey']
+        return 'unverifiable', {'error': f'{type(exc).__name__}: {exc}'}
+    detail = {'sourceKey': live['sourceKey']}
     if live['sourceSHA256'] == committed['latest']['sourceSHA256']:
-        return 'matching', detail
+        return 'matching', detail          # authenticated re-signing of the same observation
     if observation_newer(live, committed['latest']):
         return 'newer', detail
     if observation_newer(committed['latest'], live):
         return 'older', detail
-    return 'unverifiable', {**detail, 'liveError': 'overlapping chronology'}
+    return 'unverifiable', {**detail, 'error': 'overlapping chronology'}
+
+
+def _fetch_state(url: str, bust: bool, fetch, committed_bytes: bytes, committed: dict, public: bytes) -> tuple[str, dict]:
+    try:
+        body = fetch(url, bust=bust)
+    except Exception as exc:
+        return 'unreachable', {'error': f'{type(exc).__name__}: {exc}'}
+    return _classify(body, committed_bytes, committed, public)
+
+
+def classify_live(committed_bytes: bytes, committed: dict, public: bytes, url: str, fetch) -> tuple[str, dict]:
+    """State of the currently published observation at the origin (cache-busted) AND at the plain URL the headset
+    requests, each classified the same way and authenticated independently:
+
+    absent        HTTP 404 for the index
+    matching      identical bytes, or an authenticated index naming the same source observation (re-signing)
+    older         authenticated, strictly older observation (start and end)
+    newer         authenticated, strictly newer observation
+    unreachable   network error, timeout, or any non-404 HTTP error
+    unverifiable  oversized, malformed, wrong key, bad signature, or chronology that is neither older nor newer
+
+    The deployment decision uses the origin state; health additionally requires the plain state (see `stage`)."""
+    plain_state, plain = _fetch_state(url, False, fetch, committed_bytes, committed, public)
+    state, origin = _fetch_state(url, True, fetch, committed_bytes, committed, public)
+    detail = {'plainState': plain_state, **({'plainDetail': plain} if plain else {})}
+    if 'sourceKey' in origin:
+        detail['liveSourceKey'] = origin['sourceKey']
+    if 'error' in origin:
+        detail['liveError'] = origin['error']
+    return state, detail
 
 
 def stage(repo: Path, *, public_b64: str, live_index_url: str, enabled: str | None, now: datetime,
-          fetch=fetch_url, sync: bool = True) -> dict:
+          fetch=fetch_url, sync: bool = True, recheck_s: float = 150, interval_s: float = 10,
+          clock=time.monotonic, sleep=time.sleep) -> dict:
     """Deploy committed `main` only when the live publication is AUTHENTICATED and strictly older (failed-deployment
-    recovery), or genuinely absent with explicit owner allowance. Every uncertain state fails without deploying."""
+    recovery), or genuinely absent with explicit owner allowance. Every uncertain state fails without deploying.
+
+    When the origin already matches (nothing to deploy), the run is healthy only if the plain public URL also serves
+    an authenticated matching index. Otherwise the plain URL is rechecked, bounded, WITHOUT redeploying; if it is still
+    stale, unreachable or unverifiable the run fails, so it can never reset the consecutive-failure streak."""
     check_kill_switch(enabled)
     auth = Authorization.load(repo)
     check_window(auth, now)
@@ -569,6 +584,16 @@ def stage(repo: Path, *, public_b64: str, live_index_url: str, enabled: str | No
     result = {'committedIndexSHA256': sha256(committed_bytes), 'committedSourceKey': committed['latest']['sourceKey'],
               'liveState': state, **detail}
     if state == 'matching':
+        plain_state, start = detail['plainState'], clock()
+        while plain_state != 'matching' and clock() - start + interval_s <= recheck_s:
+            sleep(interval_s)
+            plain_state, plain = _fetch_state(live_index_url, False, fetch, committed_bytes, committed, public)
+            result.update(plainState=plain_state, plainDetail=plain)
+        result['plainRecheckSeconds'] = round(clock() - start, 1)
+        if plain_state != 'matching':
+            raise Failure('public-visibility-unconfirmed',
+                          f'origin matches the committed observation but the public URL is {plain_state} '
+                          f'after {result["plainRecheckSeconds"]} s (no redeployment)')
         return {**result, 'deploy': False, 'reason': 'live-matches-committed'}
     if state == 'older':
         return {**result, 'deploy': True, 'reason': 'committed-newer-than-live'}

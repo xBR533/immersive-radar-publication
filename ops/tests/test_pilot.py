@@ -644,8 +644,10 @@ def test_python_dependencies_are_hash_locked_and_installed_as_wheels_only():
 # ================================================================== Gate 2.1 targeted corrections
 
 def stage_now(w, **kw):
+    t = [0.0]
     return pilot.stage(w.checkout('stage-direct'), public_b64=w.public_b64, enabled='true', now=w.now(),
-                       live_index_url='https://example.invalid/kinx/index.json', fetch=w.pages.fetch, **kw)
+                       live_index_url='https://example.invalid/kinx/index.json', fetch=w.pages.fetch,
+                       clock=lambda: t[0], sleep=lambda d: t.__setitem__(0, t[0] + d), **kw)
 
 
 def resign(index_bytes: bytes, key_path: Path, **changes) -> bytes:
@@ -772,8 +774,10 @@ def test_A_stale_cdn_plain_response_is_reported_not_mistaken_for_the_origin(worl
     put(world, KEYS[1])
     run_once(world)
     world.pages.stale_plain = True                    # plain URL still serves K0, origin serves K1
-    r = stage_now(world)
-    assert (r['liveState'], r['deploy'], r['plainURLServesCommitted']) == ('matching', False, False)
+    deployments = world.pages.deployments
+    with pytest.raises(pilot.Failure, match='public-visibility-unconfirmed') as exc:
+        stage_now(world)
+    assert 'older' in exc.value.detail and world.pages.deployments == deployments
 
 
 # --- B: public visibility must be demonstrated
@@ -918,3 +922,100 @@ def test_expiry_reached_between_stage_and_deploy_blocks_deployment(world):
 def test_cli_preflight_refusal_exits_nonzero(world, monkeypatch):
     monkeypatch.setenv('PUBLICATION_ENABLED', 'false')
     assert pilot.main(['preflight', '--repo', str(world.checkout('pf'))]) == 1
+
+
+# ================================================================== Gate 2.2 health accounting: plain URL must match too
+
+def stale_after_publication(w):
+    """K0 visible; K1 published and deployed but the plain public URL keeps serving K0 (probe fails: failure 1)."""
+    put(w, KEYS[0])
+    assert run_once(w)['conclusion'] == 'success'
+    put(w, KEYS[1])
+    w.pages.stale_plain = True
+    out = run_once(w)
+    assert out['probe']['outcome'] == 'origin-only-cdn-stale' and out['conclusion'] == 'failure'
+    return w.pages.deployments, len(w.archive.get_requests())
+
+
+def test_2_2_stale_plain_url_cannot_reset_the_failure_streak(world):
+    deployments, gets = stale_after_publication(world)
+    out = run_once(world)                             # origin matches committed, plain URL still K0
+    assert out['acquire']['status'] == 'no-newer' and out['stage']['reason'] == 'public-visibility-unconfirmed'
+    assert out['jobs']['stage'] == 'failure' and out['conclusion'] == 'failure' and 'deploy' not in out['jobs']
+    assert run_once(world)['guard']['consecutiveFailures'] == 2    # not reset by the matching origin
+    assert world.pages.deployments == deployments and len(world.archive.get_requests()) == gets
+
+
+def test_2_2_three_unresolved_visibility_failures_reach_the_shutdown_policy(world):
+    deployments, gets = stale_after_publication(world)
+    for expected in (1, 2):
+        out = run_once(world)
+        assert out['guard']['consecutiveFailures'] == expected and out['stage']['reason'] == 'public-visibility-unconfirmed'
+    out = run_once(world)
+    assert out['guard']['reason'] == 'consecutive-failures' and out['guard']['stop'] and out['jobs']['stop'] == 'success'
+    assert 'acquire' not in out['jobs'] and 'stage' not in out['jobs']
+    assert world.pages.deployments == deployments and len(world.archive.get_requests()) == gets   # no redeploy, no NOAA
+
+
+def test_2_2_recovery_when_public_visibility_is_actually_confirmed(world):
+    deployments, gets = stale_after_publication(world)
+    assert run_once(world)['conclusion'] == 'failure'           # failure 2, still stale
+    world.pages.stale_plain = False                             # CDN refreshed
+    out = run_once(world)
+    assert out['guard']['consecutiveFailures'] == 2
+    assert out['stage']['reason'] == 'live-matches-committed' and out['stage']['plainState'] == 'matching'
+    assert out['conclusion'] == 'success'
+    assert run_once(world)['guard']['consecutiveFailures'] == 0  # a confirmed-visible run resets the streak
+    assert world.pages.deployments == deployments and len(world.archive.get_requests()) == gets
+
+
+def test_2_2_bounded_recheck_confirms_late_propagation_without_redeploying(world):
+    deployments, gets = stale_after_publication(world)
+    world.pages.stale_plain_reads = 3                 # plain URL refreshes during the stage recheck
+    out = run_once(world)
+    assert out['stage']['reason'] == 'live-matches-committed' and 0 < out['stage']['plainRecheckSeconds'] <= 150
+    assert out['conclusion'] == 'success' and world.pages.deployments == deployments
+
+
+def test_2_2_recheck_is_bounded(world):
+    stale_after_publication(world)
+    reads = world.pages.plain_reads
+    with pytest.raises(pilot.Failure, match='public-visibility-unconfirmed'):
+        stage_now(world)
+    assert world.pages.plain_reads - reads == 1 + 15  # initial read + one per 10 s within 150 s
+
+
+@pytest.mark.parametrize('plain', ['unreachable', 'garbage', 'foreign-key', 'absent'])
+def test_2_2_unreachable_or_unverifiable_plain_url_is_not_healthy(world, tmp_path, plain):
+    put(world, KEYS[0])
+    run_once(world)
+    if plain == 'unreachable':
+        world.pages.plain_body = OSError('CDN edge down')
+    elif plain == 'garbage':
+        world.pages.plain_body = b'<html>error</html>'
+    elif plain == 'foreign-key':
+        pub.keygen(tmp_path / 'f.pem')
+        world.pages.plain_body = resign(world.pages.fetch('x'), tmp_path / 'f.pem')
+    else:
+        world.pages.stale_plain, world.pages.previous = True, None     # plain answers 404
+    out = run_once(world)
+    assert out['stage']['reason'] == 'public-visibility-unconfirmed' and out['conclusion'] == 'failure'
+    assert 'deploy' not in out['jobs']
+
+
+def test_2_2_legitimately_re_signed_matching_observation_is_healthy_at_both_urls(world):
+    put(world, KEYS[0])
+    run_once(world)
+    world.pages.origin_body = resign(world.pages.fetch('x'), world.signing, publishedUtc='2026-10-30T15:59:59+00:00')
+    deployments = world.pages.deployments
+    out = run_once(world)                             # origin and plain both serve the re-signed index
+    assert out['stage']['liveState'] == 'matching' and out['stage']['plainState'] == 'matching'
+    assert out['conclusion'] == 'success' and world.pages.deployments == deployments
+
+
+def test_2_2_re_signed_origin_with_stale_plain_is_not_healthy(world):
+    deployments, _ = stale_after_publication(world)
+    world.pages.origin_body = resign(world.pages.fetch('x'), world.signing, publishedUtc='2026-10-30T16:59:59+00:00')
+    out = run_once(world)
+    assert out['stage']['reason'] == 'public-visibility-unconfirmed' and out['conclusion'] == 'failure'
+    assert world.pages.deployments == deployments

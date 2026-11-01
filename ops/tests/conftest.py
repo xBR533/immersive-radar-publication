@@ -104,11 +104,16 @@ class FakePages:
     origin_body    the origin serves these bytes instead of the deployment (tampered / foreign index)
     stale_plain    the plain URL keeps serving the previous deployment (CDN not yet refreshed); the cache-busted
                    origin request sees the new one
-    unpublished    the whole site answers 404 (e.g. owner unpublished it)"""
+    unpublished    the whole site answers 404 (e.g. owner unpublished it)
+    stale_plain_reads  if set, stale_plain clears itself after this many further plain reads (CDN catching up)
+    plain_body     the plain URL serves these bytes (or raises this exception) instead"""
     def __init__(self, root: Path):
         self.root, self.live, self.previous, self.fail_next, self.deployments = root, None, None, 0, 0
         self.unreachable = self.stale_plain = self.unpublished = False
         self.origin_body = None
+        self.plain_body = None
+        self.stale_plain_reads = None
+        self.plain_reads = 0
 
     def deploy(self, site: Path):
         if self.fail_next:
@@ -129,8 +134,19 @@ class FakePages:
             raise OSError('simulated Pages outage')
         if self.unpublished:
             return None
-        if not bust and self.stale_plain:
-            return self._index(self.previous)
+        if not bust:
+            self.plain_reads += 1
+            if isinstance(self.plain_body, BaseException):
+                raise self.plain_body
+            if self.plain_body is not None:
+                return self.plain_body
+            if self.stale_plain:
+                if self.stale_plain_reads is not None:
+                    if self.stale_plain_reads <= 0:
+                        self.stale_plain = False
+                        return self._index(self.live) if self.origin_body is None else self.origin_body
+                    self.stale_plain_reads -= 1
+                return self._index(self.previous)
         if self.origin_body is not None:
             return self.origin_body
         return self._index(self.live)
@@ -300,8 +316,10 @@ def run_once(w: World, *, produce=None, cancel_after_acquire=False, interrupt=No
     stage = None
     if not cancelled and jobs['guard'] == 'success' and g['deploy'] and acquire_result in ('success', 'failure', 'skipped'):
         try:
+            t = [0.0]                                 # virtual clock for the bounded plain-URL recheck
             stage = pilot.stage(w.checkout(f'stage-{r["id"]}'), public_b64=w.public_b64, enabled=w.enabled, now=w.now(),
-                                live_index_url='https://example.invalid/kinx/index.json', fetch=w.pages.fetch)
+                                live_index_url='https://example.invalid/kinx/index.json', fetch=w.pages.fetch,
+                                clock=lambda: t[0], sleep=lambda d: t.__setitem__(0, t[0] + d))
             jobs['stage'] = 'success'
         except pilot.Refusal as exc:
             stage, jobs['stage'] = {'deploy': False, 'reason': exc.code}, 'success'
