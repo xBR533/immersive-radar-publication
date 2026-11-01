@@ -17,3 +17,12 @@ The workflow is manual (`workflow_dispatch`), requires typing `PUBLISH-ONE`, acq
 
 To disable: Settings → Pages → Unpublish site, and Actions → "Publish one KINX observation" → Disable workflow
 (or archive/delete this repository).
+
+## IR-023 scheduled pilot (installed only after a separate owner GO)
+
+`publish-kinx-scheduled.yml` runs every 5 minutes. It is inert until the variable `PUBLICATION_ENABLED` is exactly
+`true` **and** an owner-committed `pilot/authorization.json` covers the current time (at most 48 h). Each run acquires at
+most one NOAA object (≤ 64 MiB), reserved in the append-only ledger `pilot/ledger/` before any byte is requested.
+Cumulative objects, source bytes and repository bytes are hard-capped. The workflow stops itself on expiry, after 3
+consecutive failed runs, or when a budget is reached. **To stop it now, see `docs/IR023_PILOT_RUNBOOK.md`** (kill switch,
+disable, cancel, credential response). Still not a live feed, not an operational or warning product.

@@ -1,0 +1,12 @@
+{
+  "format": "ir023-pilot-authorization",
+  "version": 1,
+  "pilotId": "ir023-pilot-1",
+  "notBeforeUtc": "2026-11-05T15:00:00+00:00",
+  "expiresUtc": "2026-11-07T15:00:00+00:00",
+  "maxSourceObjects": 600,
+  "maxSourceBytes": 8589934592,
+  "maxRepositoryBytes": 419430400,
+  "repositoryBaselineBytes": 2097152,
+  "workflowFile": "publish-kinx-scheduled.yml"
+}
