@@ -1,0 +1,14 @@
+# IR-023 D3: isolated GitHub Actions execution probe. Prints one fixed message and does nothing else:
+# no checkout, secrets, artifacts, NOAA requests, scientific code or publication.
+name: Actions execution probe (IR-023 D3)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo "IR-023 D3 probe executed; no data acquired or published."
